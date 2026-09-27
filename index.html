@@ -1398,15 +1398,7 @@
         }
 
         function getFirestoreInstance(appInstance, databaseId) {
-            let targetId = databaseId || localStorage.getItem('fb-databaseId') || '';
-            const projectId = appInstance.options?.projectId || '';
-            if (!targetId || targetId === 'ai-studio-48f55087-ae5a-4ab3-b4c4-0a15286e9759') {
-                if (projectId === 'gen-lang-client-0408655533') {
-                    targetId = 'ai-studio-48f55087-ae5a-4ab3-b4c4-0a15286e9759';
-                } else {
-                    targetId = '';
-                }
-            }
+            let targetId = databaseId || localStorage.getItem('fb-databaseId') || 'ai-studio-48f55087-ae5a-4ab3-b4c4-0a15286e9759';
             if (!targetId || targetId === '(default)') return appInstance.firestore();
             if (appInstance.container && appInstance.container.getProvider) {
                 try {
@@ -1813,6 +1805,15 @@
                     [PIPELINE START] Threshold: ${threshold}% | Dict Size: ${dictionary.length}
                 </div>`;
 
+                // Compute multi-orientation hashes for all answers once
+                const answerMultiHashes = [];
+                for (let aIdx = 0; aIdx < answers.length; aIdx++) {
+                    answerMultiHashes.push(await computeMultiOrientationPHashes(answers[aIdx].data));
+                }
+
+                // Cost matrix: target i -> answer j similarity
+                const scoreMatrix = [];
+
                 for (let i = 0; i < targets.length; i++) {
                     const target = targets[i];
                     target.hash = await computePHash(target.data);
@@ -1835,120 +1836,156 @@
                         <div style="font-size:9px; color:#888">Top 3: ${topSims.map(s => s.name + ' ' + s.sim.toFixed(0) + '%').join(' | ')}</div>
                     </div>`;
 
-                    if (maxSim >= threshold && bestMatch) {
-                        // ── FIXED: score answers against ANSWER POOL only, not target hash ──
-                        const answerHashes = [];
-                        for (let aIdx = 0; aIdx < answers.length; aIdx++) {
-                            answerHashes.push(await computePHash(answers[aIdx].data));
-                        }
+                    const answerScores = new Array(answers.length).fill(0);
 
-                        const answerScores = new Array(answers.length).fill(0);
-
+                    if (bestMatch && maxSim >= (threshold - 10)) {
+                        // Compare against all known answer variations using multi-orientation
                         if (bestMatch.answers && bestMatch.answers.length > 0) {
                             for (let knownAns of bestMatch.answers) {
                                 const knownHash = typeof knownAns === 'string' ? knownAns : (knownAns.hash || "");
                                 if (!knownHash) continue;
                                 for (let aIdx = 0; aIdx < answers.length; aIdx++) {
-                                    const sim = compareHashes(answerHashes[aIdx], knownHash);
+                                    const sim = compareMultiHashes(answerMultiHashes[aIdx], knownHash);
                                     answerScores[aIdx] = Math.max(answerScores[aIdx], sim);
                                 }
                             }
                         }
 
-                        // Secondary signal: compare against target hash at reduced weight
+                        // Also compare against target image hash (multi-orientation)
                         for (let aIdx = 0; aIdx < answers.length; aIdx++) {
-                            const simToTarget = compareHashes(answerHashes[aIdx], bestMatch.targetHash);
-                            answerScores[aIdx] = Math.max(answerScores[aIdx], simToTarget * 0.85);
+                            const simToTarget = compareMultiHashes(answerMultiHashes[aIdx], bestMatch.targetHash);
+                            // If target image matched strongly, this is a very strong signal
+                            answerScores[aIdx] = Math.max(answerScores[aIdx], simToTarget * 0.92);
                         }
-
-                        let bestAnsIdx = -1;
-                        let maxAnsSim = 0;
-                        for (let aIdx = 0; aIdx < answers.length; aIdx++) {
-                            if (answerScores[aIdx] > maxAnsSim) {
-                                maxAnsSim = answerScores[aIdx];
-                                bestAnsIdx = aIdx + 1;
-                            }
-                        }
-
-                        debugHTML += `<div style="font-size:9px; color:#888; margin-top:-6px; margin-bottom:8px;">Answer scores: [${answerScores.map(s => s.toFixed(0)).join(', ')}]</div>`;
-
-                        // Always push — let Gemini resolve low-confidence
-                        results.push({
-                            targetIndex: i,
-                            answerIndex: maxAnsSim >= threshold ? bestAnsIdx : null,
-                            answerScores,
-                            confidence: maxAnsSim,
-                            source: maxAnsSim >= threshold ? 'dictionary' : 'gemini',
-                            entry: bestMatch,
-                            lowConfidence: maxAnsSim < threshold,
-                            reason: maxAnsSim < threshold ? `Low answer confidence (${maxAnsSim.toFixed(0)}%)` : null
-                        });
-                    } else {
-                        results.push({
-                            targetIndex: i,
-                            answerIndex: null,
-                            answerScores: null,
-                            confidence: maxSim,
-                            source: 'gemini',
-                            entry: bestMatch,
-                            lowConfidence: true,
-                            reason: 'Target not matched'
-                        });
                     }
+
+                    scoreMatrix.push(answerScores);
+
+                    let bestAnsIdx = -1;
+                    let maxAnsSim = 0;
+                    for (let aIdx = 0; aIdx < answers.length; aIdx++) {
+                        if (answerScores[aIdx] > maxAnsSim) {
+                            maxAnsSim = answerScores[aIdx];
+                            bestAnsIdx = aIdx + 1;
+                        }
+                    }
+
+                    debugHTML += `<div style="font-size:9px; color:#888; margin-top:-6px; margin-bottom:8px;">Multi-rot Answer scores: [${answerScores.map(s => s.toFixed(0)).join(', ')}]</div>`;
+
+                    results.push({
+                        targetIndex: i,
+                        answerIndex: maxAnsSim >= threshold ? bestAnsIdx : null,
+                        answerScores,
+                        confidence: maxAnsSim,
+                        source: maxAnsSim >= threshold ? 'dictionary' : 'gemini',
+                        entry: bestMatch,
+                        lowConfidence: maxAnsSim < threshold,
+                        reason: maxAnsSim < threshold ? `Low confidence (${maxAnsSim.toFixed(0)}%)` : null
+                    });
                 }
 
                 debugContent.innerHTML = debugHTML;
 
-                // ── FIXED: hybrid resolution with proper collision handling ──
-                const lockedResults = results.filter(r => r.source === 'dictionary' && r.answerIndex);
-                const allSolvedByDict = results.length === targets.length &&
-                    results.every(r => r.source === 'dictionary' && r.answerIndex);
-                const lockedAnswerSet = new Set(lockedResults.map(r => r.answerIndex));
-                const noDuplicateLocks = lockedAnswerSet.size === lockedResults.length;
-                const allLocked = lockedResults.length === targets.length;
+                // ── Compute Optimal Global 1-to-1 Assignment (Never Duplicates) ──
+                function getOptimalAssignment(matrix) {
+                    const numT = matrix.length; // 3
+                    const numA = matrix[0] ? matrix[0].length : 4; // 4
+                    let bestScore = -1;
+                    let bestPerm = null;
 
-                if (allSolvedByDict && noDuplicateLocks && allLocked) {
-                    matchSource.innerText = "Solved via Dictionary (pHash)";
-                    resultNumbers.innerText = results.map(r => r.answerIndex).join("");
+                    // Generate all permutations of 3 distinct answers from available answers (e.g. 4P3 = 24 combinations)
+                    for (let a0 = 0; a0 < numA; a0++) {
+                        for (let a1 = 0; a1 < numA; a1++) {
+                            if (a1 === a0) continue;
+                            for (let a2 = 0; a2 < numA; a2++) {
+                                if (a2 === a0 || a2 === a1) continue;
+                                const perm = [a0, a1, a2];
+                                const total = (matrix[0][a0] || 0) + (matrix[1][a1] || 0) + (matrix[2][a2] || 0);
+                                if (total > bestScore) {
+                                    bestScore = total;
+                                    bestPerm = perm;
+                                }
+                            }
+                        }
+                    }
+                    return { perm: bestPerm, score: bestScore };
+                }
+
+                const optimal = getOptimalAssignment(scoreMatrix);
+                const optimalPerm = optimal.perm; // array of 0-indexed answer indices [a0, a1, a2]
+                
+                // Check if all 3 targets in optimal assignment meet confidence threshold
+                let allDictConfident = false;
+                if (optimalPerm && optimalPerm.length === targets.length) {
+                    allDictConfident = optimalPerm.every((aIdx, tIdx) => {
+                        const score = scoreMatrix[tIdx][aIdx];
+                        return score >= threshold && results[tIdx].entry;
+                    });
+                }
+
+                if (allDictConfident) {
+                    matchSource.innerText = "Solved via Dictionary (pHash Multi-Rot)";
+                    resultNumbers.innerText = optimalPerm.map(a => a + 1).join("");
                     formatResultNumbers();
                 } else {
                     matchSource.innerText = "Calling Gemini...";
-                    const matchedEntries = results.filter(r => r.entry);
+
+                    // Determine which targets can be safely locked (unambiguous, high score)
+                    const lockedResults = [];
+                    if (optimalPerm) {
+                        optimalPerm.forEach((aIdx, tIdx) => {
+                            const score = scoreMatrix[tIdx][aIdx];
+                            // Only lock if score is high and it's comfortably higher than other answers
+                            const otherScores = scoreMatrix[tIdx].filter((_, idx) => idx !== aIdx);
+                            const nextBest = Math.max(...otherScores, 0);
+                            if (score >= Math.max(threshold, 72) && (score - nextBest >= 8)) {
+                                lockedResults.push({ targetIndex: tIdx, answerIndex: aIdx + 1, confidence: score });
+                            }
+                        });
+                    }
 
                     const geminiResult = await callGeminiForPuzzle(
                         currentScreenshot, targets, answers, results, lockedResults
                     );
-                    const geminiDigits = geminiResult.replace(/\s/g, '').split('');
+                    const geminiDigits = (geminiResult.match(/[1-4]/g) || []).map(Number);
 
-                    const usedAnswers = new Set(lockedResults.map(r => r.answerIndex));
-                    const finalDigits = [];
+                    // Reconcile Gemini picks guaranteeing ZERO DUPLICATES and 1-to-1 matching
+                    const finalDigits = new Array(targets.length).fill(0);
+                    const usedAnswers = new Set();
 
+                    // Step 1: Assign locked pHash answers
+                    lockedResults.forEach(l => {
+                        finalDigits[l.targetIndex] = l.answerIndex;
+                        usedAnswers.add(l.answerIndex);
+                    });
+
+                    // Step 2: Assign Gemini choices if valid and unused
                     for (let i = 0; i < targets.length; i++) {
-                        const locked = lockedResults.find(r => r.targetIndex === i);
-                        if (locked) {
-                            finalDigits.push(String(locked.answerIndex));
-                            continue;
+                        if (finalDigits[i] !== 0) continue;
+                        const gPick = geminiDigits[i];
+                        if (gPick >= 1 && gPick <= 4 && !usedAnswers.has(gPick)) {
+                            finalDigits[i] = gPick;
+                            usedAnswers.add(gPick);
                         }
+                    }
 
-                        const geminiPick = parseInt(geminiDigits[i]);
-                        if (geminiPick >= 1 && geminiPick <= 4 && !usedAnswers.has(geminiPick)) {
-                            finalDigits.push(String(geminiPick));
-                            usedAnswers.add(geminiPick);
+                    // Step 3: For remaining unresolved targets, fill from optimal assignment or best pHash score
+                    for (let i = 0; i < targets.length; i++) {
+                        if (finalDigits[i] !== 0) continue;
+                        const optPick = (optimalPerm && optimalPerm[i] !== undefined) ? (optimalPerm[i] + 1) : null;
+                        if (optPick && !usedAnswers.has(optPick)) {
+                            finalDigits[i] = optPick;
+                            usedAnswers.add(optPick);
                         } else {
-                            // Gemini collision — use pHash scores as tiebreaker
-                            const result = results[i];
-                            const remaining = [1, 2, 3, 4].filter(n => !usedAnswers.has(n));
-                            if (remaining.length > 0) {
-                                let best = remaining[0];
-                                if (result.answerScores) {
-                                    best = remaining.reduce((a, b) =>
-                                        (result.answerScores[a - 1] || 0) > (result.answerScores[b - 1] || 0) ? a : b
-                                    );
-                                }
-                                finalDigits.push(String(best));
-                                usedAnswers.add(best);
-                            } else {
-                                finalDigits.push('0');
+                            const available = [1, 2, 3, 4].filter(n => !usedAnswers.has(n));
+                            if (available.length > 0) {
+                                // Pick highest score among available
+                                const scores = scoreMatrix[i] || [];
+                                const bestRemaining = available.reduce((a, b) => 
+                                    (scores[a - 1] || 0) >= (scores[b - 1] || 0) ? a : b
+                                );
+                                finalDigits[i] = bestRemaining;
+                                usedAnswers.add(bestRemaining);
                             }
                         }
                     }
@@ -2349,6 +2386,16 @@
             let distance = 0;
             for (let i = 0; i < h1.length; i++) if (h1[i] !== h2[i]) distance++;
             return (1 - distance / h1.length) * 100;
+        }
+
+        function compareMultiHashes(multiHashes, singleHash) {
+            if (!multiHashes || !singleHash) return 0;
+            let maxSim = 0;
+            for (let h of multiHashes) {
+                const sim = compareHashes(h, singleHash);
+                if (sim > maxSim) maxSim = sim;
+            }
+            return maxSim;
         }
 
         async function computeMultiOrientationPHashes(dataUrl) {
