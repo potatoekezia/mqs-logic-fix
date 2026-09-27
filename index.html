@@ -1805,10 +1805,19 @@
                     [PIPELINE START] Threshold: ${threshold}% | Dict Size: ${dictionary.length}
                 </div>`;
 
-                // Compute multi-orientation hashes for all answers once
+                // Pre-compute multi-orientation hashes and color signatures for both targets and answers
+                const targetMultiHashes = [];
+                const targetColors = [];
+                for (let tIdx = 0; tIdx < targets.length; tIdx++) {
+                    targetMultiHashes.push(await computeMultiOrientationPHashes(targets[tIdx].data));
+                    targetColors.push(await computeColorSignature(targets[tIdx].data));
+                }
+
                 const answerMultiHashes = [];
+                const answerColors = [];
                 for (let aIdx = 0; aIdx < answers.length; aIdx++) {
                     answerMultiHashes.push(await computeMultiOrientationPHashes(answers[aIdx].data));
+                    answerColors.push(await computeColorSignature(answers[aIdx].data));
                 }
 
                 // Cost matrix: target i -> answer j similarity
@@ -1816,14 +1825,15 @@
 
                 for (let i = 0; i < targets.length; i++) {
                     const target = targets[i];
-                    target.hash = await computePHash(target.data);
+                    target.hash = targetMultiHashes[i][0];
 
                     let bestMatch = null;
                     let maxSim = 0;
                     let allSims = [];
 
                     for (let entry of dictionary) {
-                        const sim = compareHashes(target.hash, entry.targetHash);
+                        // Multi-orientation match target against dictionary entry targetHash
+                        const sim = compareMultiHashes(targetMultiHashes[i], entry.targetHash);
                         allSims.push({ name: entry.name, sim, hash: entry.targetHash, image: entry.targetImage });
                         if (sim > maxSim) { maxSim = sim; bestMatch = entry; }
                     }
@@ -1837,25 +1847,35 @@
                     </div>`;
 
                     const answerScores = new Array(answers.length).fill(0);
+                    const matchedFromKnownAnswers = new Array(answers.length).fill(false);
 
-                    if (bestMatch && maxSim >= (threshold - 10)) {
-                        // Compare against all known answer variations using multi-orientation
+                    if (bestMatch && maxSim >= Math.max(threshold - 10, 65)) {
+                        // PRIMARY: Compare against real saved answer variations using multi-orientation
                         if (bestMatch.answers && bestMatch.answers.length > 0) {
                             for (let knownAns of bestMatch.answers) {
                                 const knownHash = typeof knownAns === 'string' ? knownAns : (knownAns.hash || "");
                                 if (!knownHash) continue;
                                 for (let aIdx = 0; aIdx < answers.length; aIdx++) {
-                                    const sim = compareMultiHashes(answerMultiHashes[aIdx], knownHash);
-                                    answerScores[aIdx] = Math.max(answerScores[aIdx], sim);
+                                    const hashSim = compareMultiHashes(answerMultiHashes[aIdx], knownHash);
+                                    const colorSim = compareColors(targetColors[i], answerColors[aIdx]);
+                                    const combined = (hashSim * 0.85) + (colorSim * 0.15);
+                                    if (combined > answerScores[aIdx]) {
+                                        answerScores[aIdx] = combined;
+                                        // Mark if this score came from an actual saved answer sprite
+                                        if (combined >= 70) matchedFromKnownAnswers[aIdx] = true;
+                                    }
                                 }
                             }
                         }
 
-                        // Also compare against target image hash (multi-orientation)
+                        // SECONDARY (Weak Hint Only): Compare against target image hash at heavy discount
+                        // NOTE: 2D target headshots do NOT match 3D isometric answer sprites well.
+                        // We cap this hint at 65% so it CANNOT falsely trigger local Dictionary solving on its own!
                         for (let aIdx = 0; aIdx < answers.length; aIdx++) {
-                            const simToTarget = compareMultiHashes(answerMultiHashes[aIdx], bestMatch.targetHash);
-                            // If target image matched strongly, this is a very strong signal
-                            answerScores[aIdx] = Math.max(answerScores[aIdx], simToTarget * 0.92);
+                            const hashSimToTarget = compareMultiHashes(answerMultiHashes[aIdx], bestMatch.targetHash);
+                            const colorSim = compareColors(targetColors[i], answerColors[aIdx]);
+                            const hintScore = Math.min(65, ((hashSimToTarget * 0.70) + (colorSim * 0.30)) * 0.80);
+                            answerScores[aIdx] = Math.max(answerScores[aIdx], hintScore);
                         }
                     }
 
@@ -1870,17 +1890,20 @@
                         }
                     }
 
-                    debugHTML += `<div style="font-size:9px; color:#888; margin-top:-6px; margin-bottom:8px;">Multi-rot Answer scores: [${answerScores.map(s => s.toFixed(0)).join(', ')}]</div>`;
+                    const hasRealAnswerMatch = bestAnsIdx > 0 && matchedFromKnownAnswers[bestAnsIdx - 1];
+
+                    debugHTML += `<div style="font-size:9px; color:#888; margin-top:-6px; margin-bottom:8px;">Multi-rot Answer scores: [${answerScores.map(s => s.toFixed(0)).join(', ')}] ${hasRealAnswerMatch ? '(from saved variant)' : '(no saved variant)'}</div>`;
 
                     results.push({
                         targetIndex: i,
-                        answerIndex: maxAnsSim >= threshold ? bestAnsIdx : null,
+                        answerIndex: (maxAnsSim >= threshold && hasRealAnswerMatch) ? bestAnsIdx : null,
                         answerScores,
                         confidence: maxAnsSim,
-                        source: maxAnsSim >= threshold ? 'dictionary' : 'gemini',
+                        source: (maxAnsSim >= threshold && hasRealAnswerMatch) ? 'dictionary' : 'gemini',
                         entry: bestMatch,
-                        lowConfidence: maxAnsSim < threshold,
-                        reason: maxAnsSim < threshold ? `Low confidence (${maxAnsSim.toFixed(0)}%)` : null
+                        hasRealAnswerMatch,
+                        lowConfidence: maxAnsSim < threshold || !hasRealAnswerMatch,
+                        reason: !hasRealAnswerMatch ? 'No known answer variant match' : (maxAnsSim < threshold ? `Low confidence (${maxAnsSim.toFixed(0)}%)` : null)
                     });
                 }
 
@@ -1914,32 +1937,34 @@
                 const optimal = getOptimalAssignment(scoreMatrix);
                 const optimalPerm = optimal.perm; // array of 0-indexed answer indices [a0, a1, a2]
                 
-                // Check if all 3 targets in optimal assignment meet confidence threshold
+                // Check if all 3 targets in optimal assignment meet confidence threshold AND have real answer variant matches
                 let allDictConfident = false;
                 if (optimalPerm && optimalPerm.length === targets.length) {
                     allDictConfident = optimalPerm.every((aIdx, tIdx) => {
                         const score = scoreMatrix[tIdx][aIdx];
-                        return score >= threshold && results[tIdx].entry;
+                        const entry = results[tIdx].entry;
+                        // MUST be above threshold, target matched dictionary, AND score came from an actual saved answer variant (not 2D crop hint)
+                        return score >= threshold && entry && score >= 75 && results[tIdx].hasRealAnswerMatch;
                     });
                 }
 
                 if (allDictConfident) {
-                    matchSource.innerText = "Solved via Dictionary (pHash Multi-Rot)";
+                    matchSource.innerText = "Solved via pHash";
                     resultNumbers.innerText = optimalPerm.map(a => a + 1).join("");
                     formatResultNumbers();
                 } else {
                     matchSource.innerText = "Calling Gemini...";
 
-                    // Determine which targets can be safely locked (unambiguous, high score)
+                    // Determine which targets can be safely locked (unambiguous, high score and clear separation)
                     const lockedResults = [];
                     if (optimalPerm) {
                         optimalPerm.forEach((aIdx, tIdx) => {
                             const score = scoreMatrix[tIdx][aIdx];
-                            // Only lock if score is high and it's comfortably higher than other answers
                             const otherScores = scoreMatrix[tIdx].filter((_, idx) => idx !== aIdx);
                             const nextBest = Math.max(...otherScores, 0);
-                            if (score >= Math.max(threshold, 72) && (score - nextBest >= 8)) {
-                                lockedResults.push({ targetIndex: tIdx, answerIndex: aIdx + 1, confidence: score });
+                            // Stricter lock: minimum 78% score, must have real answer match, and at least 10% lead over runner-up
+                            if (score >= Math.max(threshold, 78) && results[tIdx].hasRealAnswerMatch && (score - nextBest >= 10)) {
+                                lockedResults.push({ targetIndex: tIdx, answerIndex: aIdx + 1, confidence: score, name: results[tIdx].entry?.name });
                             }
                         });
                     }
@@ -2398,6 +2423,76 @@
             return maxSim;
         }
 
+        async function computeColorSignature(dataUrl) {
+            try {
+                const img = await loadImage(dataUrl);
+                const canvas = document.createElement('canvas');
+                canvas.width = 16; canvas.height = 16;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(img, 0, 0, 16, 16);
+                const data = ctx.getImageData(0, 0, 16, 16).data;
+                let rSum = 0, gSum = 0, bSum = 0, count = 0;
+                for (let i = 0; i < data.length; i += 4) {
+                    if (data[i + 3] > 30) {
+                        rSum += data[i];
+                        gSum += data[i + 1];
+                        bSum += data[i + 2];
+                        count++;
+                    }
+                }
+                if (count === 0) return { r: 128, g: 128, b: 128 };
+                return { r: Math.round(rSum / count), g: Math.round(gSum / count), b: Math.round(bSum / count) };
+            } catch (e) {
+                return { r: 128, g: 128, b: 128 };
+            }
+        }
+
+        function compareColors(c1, c2) {
+            if (!c1 || !c2) return 100;
+            const dr = (c1.r || 128) - (c2.r || 128);
+            const dg = (c1.g || 128) - (c2.g || 128);
+            const db = (c1.b || 128) - (c2.b || 128);
+            const dist = Math.sqrt(dr * dr + dg * dg + db * db); // 0 to ~441
+            // 0 dist = 100%, 150+ dist = 0%
+            return Math.max(0, 100 - (dist / 1.5));
+        }
+
+        async function createCleanQuizGrid(targets, answers) {
+            // Render a clean 2-row comparison grid on a small 400x200 canvas
+            // Row 1: T1, T2, T3 (with labels)
+            // Row 2: A1, A2, A3, A4 (with labels)
+            const canvas = document.createElement('canvas');
+            canvas.width = 440;
+            canvas.height = 220;
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = "#1e1e24";
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // Targets row
+            for (let i = 0; i < targets.length; i++) {
+                const img = await loadImage(targets[i].data);
+                const x = 50 + i * 120;
+                const y = 15;
+                ctx.drawImage(img, x, y, 70, 70);
+                ctx.fillStyle = "#a78bfa";
+                ctx.font = "bold 13px sans-serif";
+                ctx.fillText(`Target ${i + 1}`, x + 10, y + 84);
+            }
+
+            // Answers row
+            for (let i = 0; i < answers.length; i++) {
+                const img = await loadImage(answers[i].data);
+                const x = 20 + i * 105;
+                const y = 115;
+                ctx.drawImage(img, x, y, 65, 65);
+                ctx.fillStyle = "#34d399";
+                ctx.font = "bold 13px sans-serif";
+                ctx.fillText(`Choice ${i + 1}`, x + 8, y + 78);
+            }
+
+            return canvas.toDataURL('image/png');
+        }
+
         async function computeMultiOrientationPHashes(dataUrl) {
             const img = await loadImage(dataUrl);
             const canvas = document.createElement('canvas');
@@ -2454,8 +2549,16 @@
                 contents.parts.push({ inlineData: { mimeType: "image/png", data: ans.data.split(',')[1] } });
             });
 
-            contents.parts.push({ text: `FULL SCREENSHOT FOR CONTEXT:` });
-            contents.parts.push({ inlineData: { mimeType: "image/png", data: screenshot.split(',')[1] } });
+            // Generate clean, normalized quiz grid (removes mobile vs pc aspect ratio differences)
+            try {
+                const cleanGridData = await createCleanQuizGrid(targets, answers);
+                contents.parts.push({ text: `STANDARDIZED QUIZ LAYOUT (Row 1: Targets 1-3 | Row 2: Choices 1-4):` });
+                contents.parts.push({ inlineData: { mimeType: "image/png", data: cleanGridData.split(',')[1] } });
+            } catch (e) {
+                // Fallback to screenshot if grid fails
+                contents.parts.push({ text: `FULL SCREENSHOT FOR CONTEXT:` });
+                contents.parts.push({ inlineData: { mimeType: "image/png", data: screenshot.split(',')[1] } });
+            }
 
             let lockInstructions = "";
             if (lockedResults.length > 0) {
